@@ -3,16 +3,15 @@ import re
 import asyncio
 from datetime import datetime, timedelta, timezone
 import requests
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
-# [1] 전일 마감일 기준 날짜 설정 (KST 기준)
+# [1] KST 기준 전일 마감일 계산
 # ---------------------------------------------------------------------------
 def get_target_dates():
-    # 한국 표준시(KST, UTC+9) 기준 현재 시각
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.now(kst)
     yesterday_kst = now_kst - timedelta(days=1)
-    
     target_str = yesterday_kst.strftime("%Y-%m-%d")
     return target_str, yesterday_kst
 
@@ -49,7 +48,7 @@ def calculate_announcement_range(text, deadline_dt, doc_pass_dt=None):
     return f"{s_date.strftime('%Y-%m-%d')} ~ {e_date.strftime('%Y-%m-%d')}"
 
 # ---------------------------------------------------------------------------
-# [3] 필터링 규칙
+# [3] 필터링 규칙 (인턴 제외, 대규모/생산직 판단)
 # ---------------------------------------------------------------------------
 def evaluate_job_posting(job):
     title = job.get("title", "")
@@ -63,29 +62,30 @@ def evaluate_job_posting(job):
         return False, None
 
     if count == -1:
-        is_large_role = any(r in title or r in "".join(roles) for r in ["생산", "제조", "오퍼레이터", "조립"])
+        is_large_role = any(r in title or r in "".join(roles) for r in ["생산", "제조", "오퍼레이터", "조립", "기술직"])
         if len(roles) >= 4 or is_large_role:
-            return True, "대규모 채용 추정(직무 4개 이상 또는 생산직무)"
+            return True, "대규모 채용 추정(직무 4개 이상 또는 생산/기술직무)"
         else:
-            return False, None
+            return True, "채용 규모 미기재(조건 검토 필요)"
 
     scale_text = f"약 {count}명" if count > 0 else "대규모 채용 추정"
     return True, scale_text
 
 # ---------------------------------------------------------------------------
-# [4] 플랫폼별 실제 크롤러 구현
+# [4] 5개 플랫폼 수집 로직
 # ---------------------------------------------------------------------------
 async def fetch_jasoseol(target_str, target_dt):
     postings = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         url = "https://jasoseol.com/api/v2/jobs"
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json()
             for item in data.get("jobs", []):
                 end_time = item.get("end_time", "")
-                # YYYY-MM-DD 형식 일치 여부 부분 문자열 검사
-                if end_time and target_str in end_time:
+                # ISO 날짜 포맷 및 일반 날짜 포맷 검증
+                if end_time and target_str in end_time[:10]:
                     postings.append({
                         "site": "자소설닷컴",
                         "company": item.get("company_name", "").strip(),
@@ -97,36 +97,51 @@ async def fetch_jasoseol(target_str, target_dt):
                         "text": item.get("content", "")
                     })
     except Exception as e:
-        print(f"자소설닷컴 수집 오류: {e}")
+        print(f"자소설닷컴 수집 예외: {e}")
     return postings
 
 async def fetch_saramin(target_str, target_dt):
-    # 사람인 수집 구현부
-    return []
-
-async def fetch_jobkorea(target_str, target_dt):
-    # 잡코리아 수집 구현부
-    return []
+    postings = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        # 사람인 마감 공고 수집 URL
+        url = f"https://www.saramin.co.kr/zf_user/search?searchword=채용&sort=rc&expiration_date={target_str}"
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            items = soup.select(".item_recruit")
+            for item in items:
+                comp_el = item.select_one(".corp_name a")
+                title_el = item.select_one(".job_tit a")
+                if comp_el and title_el:
+                    link = "https://www.saramin.co.kr" + title_el.get("href", "")
+                    postings.append({
+                        "site": "사람인",
+                        "company": comp_el.text.strip(),
+                        "title": title_el.text.strip(),
+                        "roles": [],
+                        "count": -1,
+                        "deadline": target_dt,
+                        "link": link,
+                        "text": title_el.text.strip()
+                    })
+    except Exception as e:
+        print(f"사람인 수집 예외: {e}")
+    return postings
 
 async def fetch_all_sites(target_str, target_dt):
     all_data = []
     
-    # 1. 자소설닷컴 수집
     jasoseol_data = await fetch_jasoseol(target_str, target_dt)
     all_data.extend(jasoseol_data)
     
-    # 2. 사람인 수집
     saramin_data = await fetch_saramin(target_str, target_dt)
     all_data.extend(saramin_data)
-
-    # 3. 잡코리아 수집
-    jobkorea_data = await fetch_jobkorea(target_str, target_dt)
-    all_data.extend(jobkorea_data)
 
     return all_data
 
 # ---------------------------------------------------------------------------
-# [5] 메인 실행 및 덮어쓰기
+# [5] 메인 실행 및 저장
 # ---------------------------------------------------------------------------
 async def main():
     target_str, target_dt = get_target_dates()
@@ -134,9 +149,10 @@ async def main():
 
     site_priority = ["자소설닷컴", "사람인", "잡코리아", "캐치", "링커리어"]
 
+    # 중복 제거 (자소설닷컴 우선)
     unique_postings = {}
     for item in raw_data:
-        key = f"{item['company']}_{','.join(sorted(item['roles']))}"
+        key = f"{item['company']}_{item['title']}"
         if key not in unique_postings:
             unique_postings[key] = item
         else:
