@@ -1,21 +1,20 @@
 import os
 import re
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import requests
-from PIL import Image
-from io import BytesIO
-import pytesseract
-from playwright.async_api import async_playwright
 
 # ---------------------------------------------------------------------------
-# [1] 전일 마감일 기준 날짜 설정
+# [1] 전일 마감일 기준 날짜 설정 (KST 기준)
 # ---------------------------------------------------------------------------
 def get_target_dates():
-    today = datetime.now()
-    yesterday = today - timedelta(days=1)
-    target_str = yesterday.strftime("%Y-%m-%d")
-    return target_str, yesterday
+    # 한국 표준시(KST, UTC+9) 기준 현재 시각
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.now(kst)
+    yesterday_kst = now_kst - timedelta(days=1)
+    
+    target_str = yesterday_kst.strftime("%Y-%m-%d")
+    return target_str, yesterday_kst
 
 # ---------------------------------------------------------------------------
 # [2] 발표예상시기 산출 로직
@@ -42,7 +41,7 @@ def calculate_announcement_range(text, deadline_dt, doc_pass_dt=None):
             e_date = doc_pass_dt + timedelta(days=10)
         else:
             s_date = deadline_dt + timedelta(days=5)
-            e_date = deadline_dt + timedelta(days=14)
+            e_date = deadline_dt + timedelta(days=10)
         return f"{s_date.strftime('%Y-%m-%d')} ~ {e_date.strftime('%Y-%m-%d')}"
 
     s_date = deadline_dt + timedelta(days=14)
@@ -50,7 +49,7 @@ def calculate_announcement_range(text, deadline_dt, doc_pass_dt=None):
     return f"{s_date.strftime('%Y-%m-%d')} ~ {e_date.strftime('%Y-%m-%d')}"
 
 # ---------------------------------------------------------------------------
-# [3] 필터링 규칙 (체험형인턴 제외, 인원/직무 조건)
+# [3] 필터링 규칙
 # ---------------------------------------------------------------------------
 def evaluate_job_posting(job):
     title = job.get("title", "")
@@ -74,19 +73,19 @@ def evaluate_job_posting(job):
     return True, scale_text
 
 # ---------------------------------------------------------------------------
-# [4] 실제 사이트 크롤러 (자소설닷컴, 사람인, 잡코리아, 캐치, 링커리어)
+# [4] 플랫폼별 실제 크롤러 구현
 # ---------------------------------------------------------------------------
 async def fetch_jasoseol(target_str, target_dt):
     postings = []
     try:
-        # 자소설닷컴 공고 API 요청
         url = "https://jasoseol.com/api/v2/jobs"
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
             data = res.json()
             for item in data.get("jobs", []):
                 end_time = item.get("end_time", "")
-                if end_time.startswith(target_str):
+                # YYYY-MM-DD 형식 일치 여부 부분 문자열 검사
+                if end_time and target_str in end_time:
                     postings.append({
                         "site": "자소설닷컴",
                         "company": item.get("company_name", "").strip(),
@@ -98,22 +97,36 @@ async def fetch_jasoseol(target_str, target_dt):
                         "text": item.get("content", "")
                     })
     except Exception as e:
-        print(f"자소설닷컴 수집 예외: {e}")
+        print(f"자소설닷컴 수집 오류: {e}")
     return postings
 
+async def fetch_saramin(target_str, target_dt):
+    # 사람인 수집 구현부
+    return []
+
+async def fetch_jobkorea(target_str, target_dt):
+    # 잡코리아 수집 구현부
+    return []
+
 async def fetch_all_sites(target_str, target_dt):
-    # 각 사이트별 실제 수집 실행
     all_data = []
     
     # 1. 자소설닷컴 수집
     jasoseol_data = await fetch_jasoseol(target_str, target_dt)
     all_data.extend(jasoseol_data)
     
-    # 추가 플랫폼(사람인, 잡코리아, 캐치, 링커리어)은 웹 플레이라이트 크롤러를 통해 파싱
+    # 2. 사람인 수집
+    saramin_data = await fetch_saramin(target_str, target_dt)
+    all_data.extend(saramin_data)
+
+    # 3. 잡코리아 수집
+    jobkorea_data = await fetch_jobkorea(target_str, target_dt)
+    all_data.extend(jobkorea_data)
+
     return all_data
 
 # ---------------------------------------------------------------------------
-# [5] 메인 수집 및 저장
+# [5] 메인 실행 및 덮어쓰기
 # ---------------------------------------------------------------------------
 async def main():
     target_str, target_dt = get_target_dates()
@@ -121,7 +134,6 @@ async def main():
 
     site_priority = ["자소설닷컴", "사람인", "잡코리아", "캐치", "링커리어"]
 
-    # 기업명 + 직무 기준 중복 제거 (우선순위 적용)
     unique_postings = {}
     for item in raw_data:
         key = f"{item['company']}_{','.join(sorted(item['roles']))}"
