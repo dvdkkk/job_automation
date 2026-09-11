@@ -1,0 +1,46 @@
+name: Daily Job Scraping Automation (8 AM)
+
+on:
+  schedule:
+    # 매일 한국 시간 오전 8시 실행 (UTC 기준 전날 23:00)
+    - cron: '0 23 * * *'
+  workflow_dispatch: # 수동 실행 허용
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: 저장소 코드 체크아웃
+      uses: actions/checkout@v4
+
+    - name: Python 3.10 설정
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: System Dependencies & Tesseract OCR 설치
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tesseract-ocr tesseract-ocr-kor libtesseract-dev
+
+    - name: Python 패키지 설치
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Playwright 브라우저 설치
+      run: |
+        python -m playwright install chromium
+        python -m playwright install-deps
+
+    - name: 수집 및 자동화 스크립트 실행
+      run: |
+        python main.py
+
+    - name: 결과 파일 Git Commit & Push
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add announcement_schedule.txt
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Auto: Daily Job Schedule Update [$(date +'%Y-%m-%d')]" && git push)
