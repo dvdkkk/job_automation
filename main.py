@@ -1,188 +1,228 @@
-import os
-import re
 import asyncio
-from datetime import datetime, timedelta, timezone
-import requests
+from datetime import datetime, timedelta
+from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# [1] KST 기준 전일 마감일 계산
-# ---------------------------------------------------------------------------
-def get_target_dates():
-    kst = timezone(timedelta(hours=9))
-    now_kst = datetime.now(kst)
-    yesterday_kst = now_kst - timedelta(days=1)
-    target_str = yesterday_kst.strftime("%Y-%m-%d")
-    return target_str, yesterday_kst
+# 1. 날짜 설정 (어제 마감된 공고만 필터링)
+today = datetime.now()
+yesterday = today - timedelta(days=1)
 
-# ---------------------------------------------------------------------------
-# [2] 발표예상시기 산출 로직
-# ---------------------------------------------------------------------------
-def calculate_announcement_range(text, deadline_dt, doc_pass_dt=None):
-    pass_match = re.search(r'필기\s*합격\s*발표[:\s]*(\d{1,2})월\s*(\d{1,2})일', text)
-    if pass_match:
-        m, d = map(int, pass_match.groups())
-        target_date = datetime(deadline_dt.year, m, d)
-        return target_date.strftime("%Y-%m-%d")
+# 검색용 날짜 포맷 생성
+yesterday_m_d_1 = yesterday.strftime("%m/%d")         # 예: "09/11"
+yesterday_m_d_2 = f"{yesterday.month}/{yesterday.day}" # 예: "9/11"
+yesterday_kor = f"{yesterday.month}월 {yesterday.day}일" # 예: "9월 11일"
 
-    exam_match = re.search(r'필기\s*(?:시험|시행)[:\s]*(\d{1,2})월\s*(\d{1,2})일', text)
-    if exam_match:
-        m, d = map(int, exam_match.groups())
-        exam_dt = datetime(deadline_dt.year, m, d)
-        s_date = exam_dt + timedelta(days=2)
-        e_date = exam_dt + timedelta(days=7)
-        return f"{s_date.strftime('%Y-%m-%d')} ~ {e_date.strftime('%Y-%m-%d')}"
+print(f"=== [수집 기준일] 어제 마감된 공고: {yesterday.strftime('%Y-%m-%d')} ===")
 
-    is_direct_interview = "면접" in text and not re.search(r'(인적성|적성검사|NCS|필기전형|GSAT|SKCT)', text)
-    if is_direct_interview:
-        if doc_pass_dt:
-            s_date = doc_pass_dt + timedelta(days=5)
-            e_date = doc_pass_dt + timedelta(days=10)
-        else:
-            s_date = deadline_dt + timedelta(days=5)
-            e_date = deadline_dt + timedelta(days=10)
-        return f"{s_date.strftime('%Y-%m-%d')} ~ {e_date.strftime('%Y-%m-%d')}"
+# 2. 발표 일정 계산 함수 (규칙: 서류 마감일 기준 5~10일 뒤)
+def calculate_announcement_dates(deadline_dt):
+    start_date = deadline_dt + timedelta(days=5)
+    end_date = deadline_dt + timedelta(days=10)
+    return start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
 
-    s_date = deadline_dt + timedelta(days=14)
-    e_date = deadline_dt + timedelta(days=24)
-    return f"{s_date.strftime('%Y-%m-%d')} ~ {e_date.strftime('%Y-%m-%d')}"
+# 어제 마감일 여부 확인 함수
+def is_yesterday_deadline(text):
+    if not text:
+        return False
+    targets = [yesterday_m_d_1, yesterday_m_d_2, yesterday_kor, "어제마감", "어제 마감"]
+    return any(target in text for target in targets)
 
-# ---------------------------------------------------------------------------
-# [3] 필터링 규칙 (인턴 제외, 대규모/생산직 판단)
-# ---------------------------------------------------------------------------
-def evaluate_job_posting(job):
-    title = job.get("title", "")
-    roles = job.get("roles", [])
-    count = job.get("count", -1)
-
-    if any(k in title for k in ["체험형", "체험형인턴", "체험형 인턴"]):
-        return False, None
-
-    if len(roles) == 1 and 0 < count <= 10:
-        return False, None
-
-    if count == -1:
-        is_large_role = any(r in title or r in "".join(roles) for r in ["생산", "제조", "오퍼레이터", "조립", "기술직"])
-        if len(roles) >= 4 or is_large_role:
-            return True, "대규모 채용 추정(직무 4개 이상 또는 생산/기술직무)"
-        else:
-            return True, "채용 규모 미기재(조건 검토 필요)"
-
-    scale_text = f"약 {count}명" if count > 0 else "대규모 채용 추정"
-    return True, scale_text
-
-# ---------------------------------------------------------------------------
-# [4] 5개 플랫폼 수집 로직
-# ---------------------------------------------------------------------------
-async def fetch_jasoseol(target_str, target_dt):
-    postings = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+# --- 1) 사람인 ---
+async def scrape_saramin(page):
+    results = []
     try:
-        url = "https://jasoseol.com/api/v2/jobs"
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            for item in data.get("jobs", []):
-                end_time = item.get("end_time", "")
-                # ISO 날짜 포맷 및 일반 날짜 포맷 검증
-                if end_time and target_str in end_time[:10]:
-                    postings.append({
-                        "site": "자소설닷컴",
-                        "company": item.get("company_name", "").strip(),
-                        "title": item.get("title", "").strip(),
-                        "roles": [r.get("name", "") for r in item.get("job_categories", [])],
-                        "count": -1,
-                        "deadline": target_dt,
-                        "link": f"https://jasoseol.com/recruiting/{item.get('id')}",
-                        "text": item.get("content", "")
-                    })
+        url = "https://www.saramin.co.kr/zf_user/search/recruit?search_area=main&search_done=y&searchType=search&searchword=%EC%B1%84%EC%9A%A9&sort=date"
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        
+        soup = BeautifulSoup(await page.content(), 'html.parser')
+        items = soup.select('.item_recruit')
+        
+        for item in items:
+            date_info = item.select_one('.badge_date') or item.select_one('.date')
+            date_text = date_info.text.strip() if date_info else ""
+            
+            if is_yesterday_deadline(date_text):
+                title_elem = item.select_one('.job_tit a')
+                corp_elem = item.select_one('.corp_name a')
+                if title_elem and corp_elem:
+                    title = title_elem.text.strip()
+                    corp = corp_elem.text.strip()
+                    href = title_elem.get('href', '')
+                    link = "https://www.saramin.co.kr" + href if href.startswith('/') else href
+                    
+                    start_p, end_p = calculate_announcement_dates(yesterday)
+                    results.append({'corp': corp, 'title': title, 'link': link, 'start_p': start_p, 'end_p': end_p, 'site': '사람인'})
     except Exception as e:
-        print(f"자소설닷컴 수집 예외: {e}")
-    return postings
+        print(f"[사람인] 수집 중 예외 발생: {e}")
+    return results
 
-async def fetch_saramin(target_str, target_dt):
-    postings = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+# --- 2) 잡코리아 ---
+async def scrape_jobkorea(page):
+    results = []
     try:
-        # 사람인 마감 공고 수집 URL
-        url = f"https://www.saramin.co.kr/zf_user/search?searchword=채용&sort=rc&expiration_date={target_str}"
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            items = soup.select(".item_recruit")
-            for item in items:
-                comp_el = item.select_one(".corp_name a")
-                title_el = item.select_one(".job_tit a")
-                if comp_el and title_el:
-                    link = "https://www.saramin.co.kr" + title_el.get("href", "")
-                    postings.append({
-                        "site": "사람인",
-                        "company": comp_el.text.strip(),
-                        "title": title_el.text.strip(),
-                        "roles": [],
-                        "count": -1,
-                        "deadline": target_dt,
-                        "link": link,
-                        "text": title_el.text.strip()
-                    })
+        url = "https://www.jobkorea.co.kr/Search/?stext=%EC%B1%84%EC%9A%A9&tabType=corp&Page_No=1"
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        
+        soup = BeautifulSoup(await page.content(), 'html.parser')
+        items = soup.select('.list-post')
+        
+        for item in items:
+            date_info = item.select_one('.option .date')
+            date_text = date_info.text.strip() if date_info else ""
+            
+            if is_yesterday_deadline(date_text):
+                title_elem = item.select_one('.title')
+                corp_elem = item.select_one('.name')
+                if title_elem and corp_elem:
+                    title = title_elem.text.strip()
+                    corp = corp_elem.text.strip()
+                    href = title_elem.get('href', '')
+                    link = "https://www.jobkorea.co.kr" + href if href.startswith('/') else href
+                    
+                    start_p, end_p = calculate_announcement_dates(yesterday)
+                    results.append({'corp': corp, 'title': title, 'link': link, 'start_p': start_p, 'end_p': end_p, 'site': '잡코리아'})
     except Exception as e:
-        print(f"사람인 수집 예외: {e}")
-    return postings
+        print(f"[잡코리아] 수집 중 예외 발생: {e}")
+    return results
 
-async def fetch_all_sites(target_str, target_dt):
-    all_data = []
-    
-    jasoseol_data = await fetch_jasoseol(target_str, target_dt)
-    all_data.extend(jasoseol_data)
-    
-    saramin_data = await fetch_saramin(target_str, target_dt)
-    all_data.extend(saramin_data)
+# --- 3) 캐치 ---
+async def scrape_catch(page):
+    results = []
+    try:
+        url = "https://www.catch.co.kr/NCS/Recruit"
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        
+        soup = BeautifulSoup(await page.content(), 'html.parser')
+        items = soup.select('.recruit_list li') or soup.select('tbody tr')
+        
+        for item in items:
+            date_info = item.select_one('.date') or item.select_one('.dday')
+            date_text = date_info.text.strip() if date_info else ""
+            
+            if is_yesterday_deadline(date_text):
+                title_elem = item.select_one('.title') or item.select_one('.name a')
+                corp_elem = item.select_one('.corp') or item.select_one('.comp')
+                if title_elem and corp_elem:
+                    title = title_elem.text.strip()
+                    corp = corp_elem.text.strip()
+                    href = title_elem.get('href', '')
+                    link = "https://www.catch.co.kr" + href if href.startswith('/') else href
+                    
+                    start_p, end_p = calculate_announcement_dates(yesterday)
+                    results.append({'corp': corp, 'title': title, 'link': link, 'start_p': start_p, 'end_p': end_p, 'site': '캐치'})
+    except Exception as e:
+        print(f"[캐치] 수집 중 예외 발생: {e}")
+    return results
 
-    return all_data
+# --- 4) 링커리어 ---
+async def scrape_linkareer(page):
+    results = []
+    try:
+        url = "https://linkareer.com/list/reception?filterType=JOB&sort=CREATED_AT&order=DESC"
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
+        
+        soup = BeautifulSoup(await page.content(), 'html.parser')
+        items = soup.select('article') or soup.select('.recruit-item')
+        
+        for item in items:
+            date_info = item.select_one('.date') or item.select_one('span')
+            date_text = date_info.text.strip() if date_info else ""
+            
+            if is_yesterday_deadline(date_text):
+                title_elem = item.select_one('h5') or item.select_one('.title')
+                corp_elem = item.select_one('.company-name') or item.select_one('.organization')
+                link_elem = item.select_one('a')
+                if title_elem and corp_elem and link_elem:
+                    title = title_elem.text.strip()
+                    corp = corp_elem.text.strip()
+                    href = link_elem.get('href', '')
+                    link = "https://linkareer.com" + href if href.startswith('/') else href
+                    
+                    start_p, end_p = calculate_announcement_dates(yesterday)
+                    results.append({'corp': corp, 'title': title, 'link': link, 'start_p': start_p, 'end_p': end_p, 'site': '링커리어'})
+    except Exception as e:
+        print(f"[링커리어] 수집 중 예외 발생: {e}")
+    return results
 
-# ---------------------------------------------------------------------------
-# [5] 메인 실행 및 저장
-# ---------------------------------------------------------------------------
+# --- 5) 자소설닷컴 ---
+async def scrape_jasoseol(page):
+    results = []
+    try:
+        url = "https://jasoseol.com/"
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(3)
+        
+        soup = BeautifulSoup(await page.content(), 'html.parser')
+        items = soup.select('.employment-item') or soup.select('.item-container')
+        
+        for item in items:
+            date_info = item.select_one('.end-time') or item.select_one('.d-day')
+            date_text = date_info.text.strip() if date_info else ""
+            
+            if is_yesterday_deadline(date_text):
+                title_elem = item.select_one('.title')
+                corp_elem = item.select_one('.company-name')
+                link_elem = item.select_one('a')
+                if title_elem and corp_elem and link_elem:
+                    title = title_elem.text.strip()
+                    corp = corp_elem.text.strip()
+                    href = link_elem.get('href', '')
+                    link = "https://jasoseol.com" + href if href.startswith('/') else href
+                    
+                    start_p, end_p = calculate_announcement_dates(yesterday)
+                    results.append({'corp': corp, 'title': title, 'link': link, 'start_p': start_p, 'end_p': end_p, 'site': '자소설닷컴'})
+    except Exception as e:
+        print(f"[자소설닷컴] 수집 중 예외 발생: {e}")
+    return results
+
+# --- 메인 실행 함수 ---
 async def main():
-    target_str, target_dt = get_target_dates()
-    raw_data = await fetch_all_sites(target_str, target_dt)
-
-    site_priority = ["자소설닷컴", "사람인", "잡코리아", "캐치", "링커리어"]
-
-    # 중복 제거 (자소설닷컴 우선)
-    unique_postings = {}
-    for item in raw_data:
-        key = f"{item['company']}_{item['title']}"
-        if key not in unique_postings:
-            unique_postings[key] = item
-        else:
-            existing_site = unique_postings[key]["site"]
-            if site_priority.index(item["site"]) < site_priority.index(existing_site):
-                unique_postings[key] = item
-
-    output_lines = []
-    for item in unique_postings.values():
-        is_valid, scale_text = evaluate_job_posting(item)
-        if not is_valid:
-            continue
-
-        announcement_time = calculate_announcement_range(item["text"], item["deadline"])
-
-        output_lines.append(f"면접대상자 발표 시기: {announcement_time}")
-        output_lines.append(f"기업명: {item['company']}")
-        output_lines.append(f"채용공고명: {item['title']}")
-        output_lines.append(f"채용규모(예상): {scale_text}")
-        output_lines.append(f"채용공고링크: {item['link']}")
-        output_lines.append("-" * 40)
-
-    filename = "announcement_schedule.txt"
-    with open(filename, "w", encoding="utf-8") as f:
-        if output_lines:
-            f.write("\n".join(output_lines))
-        else:
-            f.write(f"[{target_str}] 전일 마감된 수집 대상 채용공고가 없습니다.")
-
-    print(f"완료: {filename} 업데이트 완료")
+    async with async_playwright() as p:
+        # PC 브라우저 위장 설정 (차단 방지)
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        
+        all_results = []
+        
+        print("1. 사람인 수집 중...")
+        all_results.extend(await scrape_saramin(page))
+        
+        print("2. 잡코리아 수집 중...")
+        all_results.extend(await scrape_jobkorea(page))
+        
+        print("3. 캐치 수집 중...")
+        all_results.extend(await scrape_catch(page))
+        
+        print("4. 링커리어 수집 중...")
+        all_results.extend(await scrape_linkareer(page))
+        
+        print("5. 자소설닷컴 수집 중...")
+        all_results.extend(await scrape_jasoseol(page))
+        
+        await browser.close()
+        
+        # 파일 저장
+        output_filename = "announcement_schedule.txt"
+        with open(output_filename, "w", encoding="utf-8") as f:
+            if not all_results:
+                f.write(f"어제({yesterday.strftime('%Y-%m-%d')}) 마감된 수집 대상 채용 공고가 없습니다.\n")
+            else:
+                for res in all_results:
+                    f.write(f"면접대상자 발표 시기: {res['start_p']} ~ {res['end_p']}\n")
+                    f.write(f"기업명: {res['corp']}\n")
+                    f.write(f"채용공고명: {res['title']}\n")
+                    f.write(f"출처: {res['site']}\n")
+                    f.write(f"채용공고링크: {res['link']}\n")
+                    f.write("-" * 40 + "\n")
+                    
+        print(f"=== 수집 완료: 총 {len(all_results)}건 저장됨 ===")
 
 if __name__ == "__main__":
     asyncio.run(main())
